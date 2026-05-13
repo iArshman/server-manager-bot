@@ -1,0 +1,7 @@
+aiogram==2.25.1
+motor
+paramiko
+python-dotenv
+pymongo
+cryptography
+bcrypt
