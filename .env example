@@ -32,6 +32,6 @@ ALLOWED_EXTENSIONS=.txt,.py,.js,.json,.yml,.yaml,.conf,.jpg
 LOG_LEVEL=INFO
 
 # Web Dashboard Login (Optional)
-
+WEB_PORT=
 WEB_USERNAME=admin
 WEB_PASSWORD=admin
