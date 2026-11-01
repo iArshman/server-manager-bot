@@ -9,11 +9,19 @@ load_dotenv()
 # Load credentials from environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
+TELEGRAM_ADMIN_IDS = {
+    int(value.strip())
+    for value in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
+    if value.strip()
+}
 
 # Bot token check
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN is not set")
     raise ValueError("BOT_TOKEN is required")
+
+if not TELEGRAM_ADMIN_IDS:
+    raise ValueError("TELEGRAM_ADMIN_IDS is required; set one or more Telegram user IDs")
 
 print(f"✅ Bot token loaded: {BOT_TOKEN[:10]}...")
 
@@ -30,9 +38,10 @@ else:
 # SSH configuration
 SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", 15))
 MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", 10))
+SSH_KNOWN_HOSTS = os.getenv("SSH_KNOWN_HOSTS", str(Path.home() / ".ssh" / "known_hosts"))
 
 # File manager configuration
-MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 50 * 1024 * 1024))  # default 50MB
+MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 ALLOWED_EXTENSIONS = os.getenv("ALLOWED_EXTENSIONS", None)
 
 # Logging configuration

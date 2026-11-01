@@ -132,7 +132,11 @@ Then export variables:
 ```bash
 export BOT_TOKEN=your_token
 export MONGO_URI=your_mongo_uri
+export TELEGRAM_ADMIN_IDS=123456789
+export SSH_KNOWN_HOSTS=/home/your-user/.ssh/known_hosts
 ```
+
+`TELEGRAM_ADMIN_IDS` is required and must contain the numeric Telegram user IDs allowed to operate the bot, separated by commas. SSH host keys must already be present in `SSH_KNOWN_HOSTS`; unknown hosts are rejected rather than trusted automatically.
 
 ---
 
@@ -162,11 +166,11 @@ Runs on:
 http://0.0.0.0:3000
 ```
 
-Default credentials:
+There are no default credentials. Set strong credentials and expose the dashboard only through HTTPS or a trusted VPN/reverse proxy:
 
 ```
-username: admin
-password: admin
+username: your_user
+password: your_long_random_password
 ```
 
 Change using environment variables:
