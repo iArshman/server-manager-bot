@@ -5,10 +5,14 @@ import tarfile
 import tempfile
 import shutil
 import hashlib
+import posixpath
+import shlex
+import stat
 from datetime import datetime
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import paramiko
+from config import MAX_FILE_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +20,21 @@ logger = logging.getLogger(__name__)
 file_manager_state = {}
 selected_files = {}
 file_name_cache = {}  # Cache for long filenames: {hash: filename}
+
+
+def safe_remote_path(base, name=None):
+    """Return a normalized child path and reject attempts to leave base."""
+    base = posixpath.normpath(base)
+    if name and (posixpath.isabs(name) or name in (".", "..") or "/" in name or "\\" in name):
+        raise ValueError("invalid remote filename")
+    candidate = posixpath.normpath(posixpath.join(base, name or ""))
+    if candidate != base and not candidate.startswith(base.rstrip("/") + "/"):
+        raise ValueError("remote path escapes allowed directory")
+    return candidate
+
+
+def shell_quote(value):
+    return shlex.quote(str(value))
 
 def get_file_hash(filename):
     """Generate short hash for long filenames"""
@@ -168,7 +187,7 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             folder_name = get_cached_filename(folder_identifier)
             
             current_path = file_manager_state[user_id]['current_path']
-            new_path = os.path.join(current_path, folder_name).replace('\\', '/')
+            new_path = safe_remote_path(current_path, folder_name)
             file_manager_state[user_id]['current_path'] = new_path
             
             await show_file_manager(callback, server_id, new_path)
@@ -430,12 +449,17 @@ def init_file_manager(dp, bot, active_sessions, user_input):
             
             await callback.message.edit_text("📤 <b>Downloading file...</b>", parse_mode='HTML')
             
-            # Download file from server
+            remote_size = await get_remote_file_size(server_id, current_path, file_name, active_sessions)
+            if remote_size is None or remote_size > MAX_FILE_SIZE:
+                await callback.message.edit_text("❌ <b>File too large or unavailable</b>", parse_mode='HTML')
+                return
+
+            # Download file from server only after the size check
             file_content = await download_file_from_server(server_id, current_path, file_name, active_sessions)
             
             if file_content:
                 # Check file size (Telegram limit is 50MB)
-                if len(file_content) > 50 * 1024 * 1024:
+                if len(file_content) > MAX_FILE_SIZE:
                     await callback.message.edit_text("❌ <b>File too large for Telegram (>50MB)</b>", parse_mode='HTML')
                     return
                 
@@ -935,53 +959,26 @@ async def get_current_user(server_id, active_sessions):
         return 'user'
 
 async def get_file_listing(server_id, path, active_sessions):
-    """Get file listing from remote server"""
+    """Get a reliable file listing through SFTP, not human-formatted ls output."""
     try:
         if server_id not in active_sessions:
             return None
-        
-        ssh = active_sessions[server_id]
-        
-        # Execute ls command with detailed info
-        command = f"ls -la '{path}' 2>/dev/null"
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode().strip()
-        error = stderr.read().decode().strip()
-        
-        if error:
-            logger.error(f"ls command error: {error}")
-            return None
-        
+        sftp = active_sessions[server_id].open_sftp()
         files = []
-        lines = output.split('\n')[1:]  # Skip total line
-        
-        for line in lines:
-            if not line.strip():
+        for entry in sftp.listdir_attr(path):
+            if entry.filename in ('.', '..'):
                 continue
-                
-            parts = line.split()
-            if len(parts) < 9:
-                continue
-            
-            permissions = parts[0]
-            name = ' '.join(parts[8:])
-            
-            if name in ['.']:
-                continue
-            
-            file_type = 'directory' if permissions.startswith('d') else 'file'
+            mode = entry.st_mode
+            is_dir = stat.S_ISDIR(mode)
             files.append({
-                'name': name,
-                'type': file_type,
-                'permissions': permissions,
-                'size': parts[4] if file_type == 'file' else None
+                'name': entry.filename,
+                'type': 'directory' if is_dir else 'file',
+                'permissions': stat.filemode(mode),
+                'size': entry.st_size if not is_dir else None
             })
-        
-        # Sort: directories first, then files
+        sftp.close()
         files.sort(key=lambda x: (x['type'] == 'file', x['name'].lower()))
-        
         return files
-        
     except Exception as e:
         logger.error(f"Get file listing error: {e}")
         return None
@@ -993,13 +990,13 @@ async def create_folder(server_id, path, folder_name, active_sessions):
             return False
         
         ssh = active_sessions[server_id]
-        folder_path = os.path.join(path, folder_name).replace('\\', '/')
+        folder_path = safe_remote_path(path, folder_name)
         
-        command = f"mkdir '{folder_path}'"
+        command = f"mkdir -- {shell_quote(folder_path)}"
         stdin, stdout, stderr = ssh.exec_command(command)
         error = stderr.read().decode().strip()
         
-        return not error
+        return stdout.channel.recv_exit_status() == 0 and not error
         
     except Exception as e:
         logger.error(f"Create folder error: {e}")
@@ -1014,7 +1011,7 @@ async def upload_file(server_id, path, filename, content, active_sessions):
         ssh = active_sessions[server_id]
         sftp = ssh.open_sftp()
         
-        remote_path = os.path.join(path, filename).replace('\\', '/')
+        remote_path = safe_remote_path(path, filename)
         
         with tempfile.NamedTemporaryFile() as temp_file:
             temp_file.write(content)
@@ -1028,6 +1025,19 @@ async def upload_file(server_id, path, filename, content, active_sessions):
         logger.error(f"Upload file error: {e}")
         return False
 
+async def get_remote_file_size(server_id, path, filename, active_sessions):
+    try:
+        if server_id not in active_sessions:
+            return None
+        sftp = active_sessions[server_id].open_sftp()
+        size = sftp.stat(safe_remote_path(path, filename)).st_size
+        sftp.close()
+        return size
+    except Exception as e:
+        logger.error(f"Remote file size error: {e}")
+        return None
+
+
 async def download_file_from_server(server_id, path, filename, active_sessions):
     """Download file from server"""
     try:
@@ -1037,7 +1047,7 @@ async def download_file_from_server(server_id, path, filename, active_sessions):
         ssh = active_sessions[server_id]
         sftp = ssh.open_sftp()
         
-        remote_path = os.path.join(path, filename).replace('\\', '/')
+        remote_path = safe_remote_path(path, filename)
         
         with tempfile.NamedTemporaryFile() as temp_file:
             sftp.get(remote_path, temp_file.name)
@@ -1058,14 +1068,14 @@ async def rename_item(server_id, path, old_name, new_name, active_sessions):
             return False
         
         ssh = active_sessions[server_id]
-        old_path = os.path.join(path, old_name).replace('\\', '/')
-        new_path = os.path.join(path, new_name).replace('\\', '/')
+        old_path = safe_remote_path(path, old_name)
+        new_path = safe_remote_path(path, new_name)
         
-        command = f"mv '{old_path}' '{new_path}'"
+        command = f"mv -- {shell_quote(old_path)} {shell_quote(new_path)}"
         stdin, stdout, stderr = ssh.exec_command(command)
         error = stderr.read().decode().strip()
         
-        return not error
+        return stdout.channel.recv_exit_status() == 0 and not error
         
     except Exception as e:
         logger.error(f"Rename item error: {e}")
@@ -1080,12 +1090,12 @@ async def delete_files_on_server(server_id, path, filenames, active_sessions):
         ssh = active_sessions[server_id]
         
         for filename in filenames:
-            file_path = os.path.join(path, filename).replace('\\', '/')
-            command = f"rm -rf '{file_path}'"
+            file_path = safe_remote_path(path, filename)
+            command = f"rm -rf -- {shell_quote(file_path)}"
             stdin, stdout, stderr = ssh.exec_command(command)
             error = stderr.read().decode().strip()
             
-            if error:
+            if error or stdout.channel.recv_exit_status() != 0:
                 logger.error(f"Delete error for {filename}: {error}")
                 return False
         
@@ -1107,20 +1117,20 @@ async def create_zip_on_server(server_id, path, filenames, zip_name, active_sess
         stdin, stdout, stderr = ssh.exec_command("which zip")
         if not stdout.read().decode().strip():
             # Try with tar if zip is not available
-            files_str = ' '.join([f"'{f}'" for f in filenames])
+            files_str = ' '.join(shell_quote(safe_remote_path(path, f)) for f in filenames)
             tar_name = zip_name.replace('.zip', '.tar.gz')
-            command = f"cd '{path}' && tar -czf '{tar_name}' {files_str}"
+            command = f"cd -- {shell_quote(path)} && tar -czf {shell_quote(safe_remote_path(path, tar_name))} {files_str}"
         else:
             # Use zip
-            files_str = ' '.join([f"'{f}'" for f in filenames])
-            command = f"cd '{path}' && zip -r '{zip_name}' {files_str}"
+            files_str = ' '.join(shell_quote(safe_remote_path(path, f)) for f in filenames)
+            command = f"cd -- {shell_quote(path)} && zip -r {shell_quote(safe_remote_path(path, zip_name))} {files_str}"
         
         stdin, stdout, stderr = ssh.exec_command(command)
         stdout_output = stdout.read().decode()
         error = stderr.read().decode().strip()
         
         # Check if command succeeded
-        if not error or "adding:" in stdout_output or "deflated" in stdout_output:
+        if stdout.channel.recv_exit_status() == 0 and not error:
             return True
         
         logger.error(f"Zip creation error: {error}")
@@ -1138,44 +1148,44 @@ async def extract_archive_on_server(server_id, path, archive_filename, active_se
         
         ssh = active_sessions[server_id]
         
-        archive_path = os.path.join(path, archive_filename).replace('\\', '/')
+        archive_path = safe_remote_path(path, archive_filename)
         
         # Create extraction directory
         extract_dir = os.path.splitext(archive_filename)[0]
         if extract_dir.endswith('.tar'):
             extract_dir = os.path.splitext(extract_dir)[0]
         
-        extract_path = os.path.join(path, extract_dir).replace('\\', '/')
+        extract_path = safe_remote_path(path, extract_dir)
         
         # Create extraction directory
-        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p '{extract_path}'")
+        stdin, stdout, stderr = ssh.exec_command(f"mkdir -p -- {shell_quote(extract_path)}")
         
         # Determine archive type and extract
         if archive_filename.lower().endswith('.zip'):
             # Check if unzip is available
             stdin, stdout, stderr = ssh.exec_command("which unzip")
             if stdout.read().decode().strip():
-                command = f"cd '{extract_path}' && unzip '{archive_path}'"
+                command = f"cd -- {shell_quote(extract_path)} && unzip {shell_quote(archive_path)}"
             else:
                 return False
                 
         elif archive_filename.lower().endswith(('.tar.gz', '.tgz')):
-            command = f"cd '{extract_path}' && tar -xzf '{archive_path}'"
+            command = f"cd -- {shell_quote(extract_path)} && tar -xzf {shell_quote(archive_path)}"
             
         elif archive_filename.lower().endswith(('.tar.bz2', '.tbz2')):
-            command = f"cd '{extract_path}' && tar -xjf '{archive_path}'"
+            command = f"cd -- {shell_quote(extract_path)} && tar -xjf {shell_quote(archive_path)}"
             
         elif archive_filename.lower().endswith(('.tar.xz', '.txz')):
-            command = f"cd '{extract_path}' && tar -xJf '{archive_path}'"
+            command = f"cd -- {shell_quote(extract_path)} && tar -xJf {shell_quote(archive_path)}"
             
         elif archive_filename.lower().endswith('.tar'):
-            command = f"cd '{extract_path}' && tar -xf '{archive_path}'"
+            command = f"cd -- {shell_quote(extract_path)} && tar -xf {shell_quote(archive_path)}"
             
         elif archive_filename.lower().endswith('.rar'):
             # Check if unrar is available
             stdin, stdout, stderr = ssh.exec_command("which unrar")
             if stdout.read().decode().strip():
-                command = f"cd '{extract_path}' && unrar x '{archive_path}'"
+                command = f"cd -- {shell_quote(extract_path)} && unrar x {shell_quote(archive_path)}"
             else:
                 return False
                 
@@ -1183,7 +1193,7 @@ async def extract_archive_on_server(server_id, path, archive_filename, active_se
             # Check if 7z is available
             stdin, stdout, stderr = ssh.exec_command("which 7z")
             if stdout.read().decode().strip():
-                command = f"cd '{extract_path}' && 7z x '{archive_path}'"
+                command = f"cd -- {shell_quote(extract_path)} && 7z x {shell_quote(archive_path)}"
             else:
                 return False
         else:
@@ -1194,7 +1204,7 @@ async def extract_archive_on_server(server_id, path, archive_filename, active_se
         error = stderr.read().decode().strip()
         
         # Check if extraction succeeded
-        if not error or "inflating:" in stdout_output or "extracting:" in stdout_output or "x " in stdout_output:
+        if stdout.channel.recv_exit_status() == 0 and not error:
             return True
         
         logger.error(f"Extract error: {error}")
@@ -1213,19 +1223,19 @@ async def copy_files_on_server(server_id, source_path, filenames, dest_path, act
         ssh = active_sessions[server_id]
         
         # Create destination directory if it doesn't exist
-        command = f"mkdir -p '{dest_path}'"
+        command = f"mkdir -p -- {shell_quote(dest_path)}"
         stdin, stdout, stderr = ssh.exec_command(command)
         
         # Copy each file
         for filename in filenames:
-            source_file = os.path.join(source_path, filename).replace('\\', '/')
-            dest_file = os.path.join(dest_path, filename).replace('\\', '/')
+            source_file = safe_remote_path(source_path, filename)
+            dest_file = safe_remote_path(dest_path, filename)
             
-            command = f"cp -r '{source_file}' '{dest_file}'"
+            command = f"cp -r -- {shell_quote(source_file)} {shell_quote(dest_file)}"
             stdin, stdout, stderr = ssh.exec_command(command)
             error = stderr.read().decode().strip()
             
-            if error:
+            if error or stdout.channel.recv_exit_status() != 0:
                 logger.error(f"Copy error for {filename}: {error}")
                 return False
         
@@ -1244,19 +1254,19 @@ async def move_files_on_server(server_id, source_path, filenames, dest_path, act
         ssh = active_sessions[server_id]
         
         # Create destination directory if it doesn't exist
-        command = f"mkdir -p '{dest_path}'"
+        command = f"mkdir -p -- {shell_quote(dest_path)}"
         stdin, stdout, stderr = ssh.exec_command(command)
         
         # Move each file
         for filename in filenames:
-            source_file = os.path.join(source_path, filename).replace('\\', '/')
-            dest_file = os.path.join(dest_path, filename).replace('\\', '/')
+            source_file = safe_remote_path(source_path, filename)
+            dest_file = safe_remote_path(dest_path, filename)
             
-            command = f"mv '{source_file}' '{dest_file}'"
+            command = f"mv -- {shell_quote(source_file)} {shell_quote(dest_file)}"
             stdin, stdout, stderr = ssh.exec_command(command)
             error = stderr.read().decode().strip()
             
-            if error:
+            if error or stdout.channel.recv_exit_status() != 0:
                 logger.error(f"Move error for {filename}: {error}")
                 return False
         

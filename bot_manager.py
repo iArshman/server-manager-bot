@@ -1,6 +1,8 @@
 import logging
 import asyncio
 import hashlib
+import shlex
+import html
 from aiogram import types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -144,16 +146,19 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                     t = bot_info['type']
                     n = bot_info['name']
                     if t == 'systemd':
-                        _, out, _ = ssh.exec_command(f"systemctl is-active {n} 2>/dev/null || echo inactive")
+                        _, out, _ = ssh.exec_command(f"systemctl is-active -- {shlex.quote(n)} 2>/dev/null || echo inactive")
                         bot_info['status'] = 'running' if out.read().decode().strip() == 'active' else 'stopped'
                     elif t == 'docker':
-                        _, out, _ = ssh.exec_command(f"docker inspect --format='{{{{.State.Status}}}}' {n} 2>/dev/null || echo stopped")
+                        _, out, _ = ssh.exec_command(f"docker inspect --format='{{{{.State.Status}}}}' {shlex.quote(n)} 2>/dev/null || echo stopped")
                         bot_info['status'] = 'running' if out.read().decode().strip() == 'running' else 'stopped'
                     elif t == 'pm2':
-                        _, out, _ = ssh.exec_command(f"pm2 describe {n} --no-color 2>/dev/null | grep status || echo stopped")
+                        _, out, _ = ssh.exec_command(f"pm2 describe {shlex.quote(n)} --no-color 2>/dev/null | grep status || echo stopped")
                         bot_info['status'] = 'running' if 'online' in out.read().decode() else 'stopped'
                     elif t == 'process':
-                        _, out, _ = ssh.exec_command(f"ps -p {bot_info.get('pid','0')} > /dev/null 2>&1 && echo running || echo stopped")
+                        pid = str(bot_info.get('pid', '0'))
+                        if not pid.isdigit():
+                            return None
+                        _, out, _ = ssh.exec_command(f"ps -p {pid} > /dev/null 2>&1 && echo running || echo stopped")
                         bot_info['status'] = out.read().decode().strip()
                     return bot_info
             return None
@@ -173,25 +178,20 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             t = bot_info['type']
             n = bot_info['name']
             cmds = {
-                'systemd': {'start': f"sudo systemctl start {n}", 'stop': f"sudo systemctl stop {n}", 'restart': f"sudo systemctl restart {n}"},
-                'docker':  {'start': f"docker start {n}", 'stop': f"docker stop {n}", 'restart': f"docker restart {n}"},
-                'pm2':     {'start': f"pm2 start {n}", 'stop': f"pm2 stop {n}", 'restart': f"pm2 restart {n}"},
+                'systemd': {'start': f"sudo systemctl start -- {shlex.quote(n)}", 'stop': f"sudo systemctl stop -- {shlex.quote(n)}", 'restart': f"sudo systemctl restart -- {shlex.quote(n)}"},
+                'docker':  {'start': f"docker start {shlex.quote(n)}", 'stop': f"docker stop {shlex.quote(n)}", 'restart': f"docker restart {shlex.quote(n)}"},
+                'pm2':     {'start': f"pm2 start {shlex.quote(n)}", 'stop': f"pm2 stop {shlex.quote(n)}", 'restart': f"pm2 restart {shlex.quote(n)}"},
             }
             if t in cmds and action in cmds[t]:
                 _, stdout, stderr = ssh.exec_command(cmds[t][action])
             elif t == 'process':
                 if action == 'stop':
-                    _, stdout, stderr = ssh.exec_command(f"kill {bot_info.get('pid','0')}")
-                elif action == 'start':
-                    if 'command' not in bot_info:
-                        return False, "No start command available"
-                    _, stdout, stderr = ssh.exec_command(f"nohup {bot_info['command']} > /dev/null 2>&1 &")
-                elif action == 'restart':
-                    ssh.exec_command(f"kill {bot_info.get('pid','0')}")
-                    await asyncio.sleep(2)
-                    if 'command' not in bot_info:
-                        return False, "No start command available"
-                    _, stdout, stderr = ssh.exec_command(f"nohup {bot_info['command']} > /dev/null 2>&1 &")
+                    pid = str(bot_info.get('pid', '0'))
+                    if not pid.isdigit():
+                        return False, "Invalid process ID"
+                    _, stdout, stderr = ssh.exec_command(f"kill -- {pid}")
+                else:
+                    return False, "Starting/restarting arbitrary processes is disabled for safety"
             else:
                 return False, "Unsupported type/action"
             exit_status = stdout.channel.recv_exit_status()
@@ -309,7 +309,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                 try:
                     if service_type == 'systemd':
                         _, out, _ = ssh.exec_command(
-                            f"systemctl show {service_name} --no-pager --property=Description,ExecStart,WorkingDirectory,User,FragmentPath 2>/dev/null"
+                            f"systemctl show -- {shlex.quote(service_name)} --no-pager --property=Description,ExecStart,WorkingDirectory,User,FragmentPath 2>/dev/null"
                         )
                         props = {}
                         for line in out.read().decode().splitlines():
@@ -325,12 +325,12 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                         )
                     elif service_type == 'docker':
                         _, out, _ = ssh.exec_command(
-                            f"docker inspect --format='{{{{.Config.Image}}}}|{{{{.HostConfig.NetworkMode}}}}' {service_name} 2>/dev/null"
+                            f"docker inspect --format='{{{{.Config.Image}}}}|{{{{.HostConfig.NetworkMode}}}}' {shlex.quote(service_name)} 2>/dev/null"
                         )
                         info = out.read().decode().strip().split('|')
                         image = info[0] if info else 'unknown'
                         network = info[1] if len(info) > 1 else 'bridge'
-                        _, pout, _ = ssh.exec_command(f"docker port {service_name} 2>/dev/null || echo 'No ports'")
+                        _, pout, _ = ssh.exec_command(f"docker port {shlex.quote(service_name)} 2>/dev/null || echo 'No ports'")
                         ports = pout.read().decode().strip() or 'No ports'
                         location = f"Docker container"
                         description = f"Image: {image}"
@@ -340,7 +340,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                             f"🔌 Ports: <code>{ports}</code>"
                         )
                     elif service_type == 'pm2':
-                        _, out, _ = ssh.exec_command(f"pm2 describe {service_name} --no-color 2>/dev/null | grep -E '(script path|root path|pid|status)'")
+                        _, out, _ = ssh.exec_command(f"pm2 describe {shlex.quote(service_name)} --no-color 2>/dev/null | grep -E '(script path|root path|pid|status)'")
                         pm2_info = out.read().decode().strip()
                         location = "PM2 managed process"
                         description = "PM2 process manager"
@@ -514,13 +514,13 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
             t, n = bot_info['type'], bot_info['name']
             logs = ""
             if t == 'systemd':
-                _, out, _ = ssh.exec_command(f"journalctl -u {n} --no-pager -n 20")
+                _, out, _ = ssh.exec_command(f"journalctl -u {shlex.quote(n)} --no-pager -n 20")
                 logs = out.read().decode().strip()
             elif t == 'docker':
-                _, out, _ = ssh.exec_command(f"docker logs --tail 20 {n}")
+                _, out, _ = ssh.exec_command(f"docker logs --tail 20 {shlex.quote(n)}")
                 logs = out.read().decode().strip()
             elif t == 'pm2':
-                _, out, _ = ssh.exec_command(f"pm2 logs {n} --lines 20 --nostream")
+                _, out, _ = ssh.exec_command(f"pm2 logs {shlex.quote(n)} --lines 20 --nostream")
                 logs = out.read().decode().strip()
             else:
                 logs = "Process logs not available."
@@ -530,7 +530,7 @@ def init_bot_manager(dp, bot, active_sessions, user_input):
                 logs = "No logs available"
             back_cb = cache_callback_data(f"bot_detail_{server_id}_{bot_id}")
             await callback.message.edit_text(
-                f"📊 <b>Bot Logs</b>\n\n<code>{logs}</code>", parse_mode='HTML',
+                f"📊 <b>Bot Logs</b>\n\n<code>{html.escape(logs)}</code>", parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("⬅️ Back to Bot", callback_data=back_cb)))
         except Exception as e:
             logger.error(f"bot_logs: {e}")

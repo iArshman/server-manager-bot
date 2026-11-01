@@ -2,13 +2,16 @@ import logging
 import io
 import html
 import asyncio
+import os
 import paramiko
 from aiohttp import web as aio_web
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from aiogram.utils import executor
 from aiogram.utils.exceptions import MessageNotModified
-from config import BOT_TOKEN
+from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.dispatcher.handler import CancelHandler
+from config import BOT_TOKEN, SSH_TIMEOUT, SSH_KNOWN_HOSTS, TELEGRAM_ADMIN_IDS
 from db import (
     add_server,
     get_servers,
@@ -32,6 +35,23 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+
+
+class AuthorizationMiddleware(BaseMiddleware):
+    """Reject every Telegram update unless it comes from a configured admin."""
+
+    async def on_process_message(self, message, data):
+        if message.from_user.id not in TELEGRAM_ADMIN_IDS:
+            await message.answer("⛔ Unauthorized user.")
+            raise CancelHandler()
+
+    async def on_process_callback_query(self, callback, data):
+        if callback.from_user.id not in TELEGRAM_ADMIN_IDS:
+            await callback.answer("Unauthorized user.", show_alert=True)
+            raise CancelHandler()
+
+
+dp.middleware.setup(AuthorizationMiddleware())
 
 # --- UTILS ---
 
@@ -116,8 +136,9 @@ def get_ssh_session(server_id, ip, username, key_content):
             raise paramiko.SSHException("Unsupported or invalid key format")
         
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(ip, username=username, pkey=ssh_key, timeout=15)
+        ssh.load_host_keys(os.path.expanduser(SSH_KNOWN_HOSTS))
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        ssh.connect(ip, username=username, pkey=ssh_key, timeout=SSH_TIMEOUT)
         
         active_sessions[server_id] = ssh
         logger.info(f"Created new SSH session for {server_id}")
@@ -136,6 +157,14 @@ def close_ssh_session(server_id):
             pass
         active_sessions.pop(server_id, None)
         logger.info(f"Closed SSH session for {server_id}")
+
+
+def _execute_terminal_command(ssh, command):
+    stdin, stdout, stderr = ssh.exec_command(command, timeout=SSH_TIMEOUT)
+    return (
+        stdout.read().decode('utf-8', errors='replace').strip(),
+        stderr.read().decode('utf-8', errors='replace').strip(),
+    )
 
 # --- SERVER STATS ---
 
@@ -464,7 +493,8 @@ async def handle_key_upload(message: types.Message):
         await message.answer("🔌 Testing connection...")
         
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.load_host_keys(os.path.expanduser(SSH_KNOWN_HOSTS))
+        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
         
         try:
             key_file = io.StringIO(key_content)
@@ -482,14 +512,11 @@ async def handle_key_upload(message: types.Message):
             if not ssh_key:
                 raise ValueError("Invalid or unsupported key format")
             
-            ssh.connect(data['ip'], username=data['username'], pkey=ssh_key, timeout=15)
+            ssh.connect(data['ip'], username=data['username'], pkey=ssh_key, timeout=SSH_TIMEOUT)
             ssh.close()
             
-            await add_server(data)
-            
-            servers = await get_servers()
-            new_server = servers[-1]
-            server_id = str(new_server['_id'])
+            inserted_id = await add_server(data)
+            server_id = str(inserted_id)
             
             try:
                 get_ssh_session(server_id, data['ip'], data['username'], key_content)
@@ -585,7 +612,8 @@ async def server_info(callback: types.CallbackQuery):
         
         await callback.message.edit_text("📊 <b>Fetching server statistics...</b>", parse_mode="HTML")
         
-        stats = get_remote_stats(server_id, server['ip'], server['username'], server['key_content'])
+        stats = await asyncio.to_thread(
+            get_remote_stats, server_id, server['ip'], server['username'], server['key_content'])
         
         if stats.get('error'):
             text = (
@@ -911,9 +939,8 @@ async def handle_terminal_command(message: types.Message):
         processing_msg = await message.answer("⏳ <i>Executing...</i>", parse_mode="HTML")
         
         # Execute command
-        stdin, stdout, stderr = ssh.exec_command(command, timeout=20)
-        output = stdout.read().decode('utf-8', errors='replace').strip()
-        error = stderr.read().decode('utf-8', errors='replace').strip()
+        output, error = await asyncio.to_thread(
+            _execute_terminal_command, ssh, command)
         
         # Combine output or use fallback text
         response = output if output else error

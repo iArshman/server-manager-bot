@@ -2,6 +2,7 @@
 
 # Get your token from @BotFather
 BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
+TELEGRAM_ADMIN_IDS=123456789
 
 
 # MongoDB Configuration
@@ -12,6 +13,7 @@ MONGO_URI=YOUR_MONGODB_CONNECTION_URI
 
 # SSH connection timeout (seconds)
 SSH_TIMEOUT=15
+SSH_KNOWN_HOSTS=/root/.ssh/known_hosts
 
 # Maximum simultaneous SSH connections
 MAX_CONNECTIONS=10
@@ -21,7 +23,7 @@ MAX_CONNECTIONS=10
 
 
 # Maximum file download size via Telegram (MB)
-MAX_FILE_SIZE=50
+MAX_FILE_SIZE_MB=50
 
 # Allowed file extensions (comma-separated)
 ALLOWED_EXTENSIONS=.txt,.py,.js,.json,.yml,.yaml,.conf,.jpg
@@ -32,6 +34,7 @@ ALLOWED_EXTENSIONS=.txt,.py,.js,.json,.yml,.yaml,.conf,.jpg
 LOG_LEVEL=INFO
 
 # Web Dashboard Login (Optional)
-WEB_PORT=
-WEB_USERNAME=admin
-WEB_PASSWORD=admin
+WEB_PORT=3000
+WEB_USERNAME=change_me
+WEB_PASSWORD=use_a_long_random_password
+WEB_COOKIE_SECURE=1

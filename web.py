@@ -3,6 +3,9 @@ Web dashboard for Multi Server Manager Bot — Modern redesign with live server 
 """
 import os
 import hashlib
+import hmac
+import secrets
+import time
 import logging
 import json
 from aiohttp import web
@@ -16,9 +19,13 @@ active_sessions = None
 managed_bots = None
 WEB_USERNAME = os.getenv("WEB_USERNAME", "admin")
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "admin")
+WEB_SESSION_TTL = 86400 * 7
+_sessions = {}
 
 def setup_web_module(bot_instance, servers_collection, active_sessions_dict, managed_bots_dict):
     global bot, db_servers, active_sessions, managed_bots
+    if WEB_USERNAME == 'admin' and WEB_PASSWORD == 'admin':
+        raise RuntimeError('Change WEB_USERNAME and WEB_PASSWORD before enabling the dashboard')
     bot = bot_instance
     db_servers = servers_collection
     active_sessions = active_sessions_dict
@@ -26,6 +33,28 @@ def setup_web_module(bot_instance, servers_collection, active_sessions_dict, man
 
 def hash_password(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
+
+
+def create_session():
+    token = secrets.token_urlsafe(32)
+    _sessions[token] = time.time() + WEB_SESSION_TTL
+    return token
+
+
+def authenticated(request):
+    token = request.cookies.get('sm_session')
+    expires = _sessions.get(token)
+    if not token or not expires or expires < time.time():
+        _sessions.pop(token, None)
+        return False
+    return True
+
+
+def set_session_cookie(response, token):
+    response.set_cookie(
+        'sm_session', token, max_age=WEB_SESSION_TTL,
+        httponly=True, secure=os.getenv('WEB_COOKIE_SECURE', '1') == '1',
+        samesite='Lax', path='/')
 
 def get_remote_stats_sync(ssh):
     """Fetch server stats via existing SSH session"""
@@ -262,9 +291,7 @@ footer a:hover{{color:var(--primary)}}
 
 async def stats_api_handler(request):
     """JSON API — returns live stats for all servers"""
-    session = request.cookies.get('sm_session')
-    expected = hash_password(WEB_USERNAME + WEB_PASSWORD)
-    if not session or session != expected:
+    if not authenticated(request):
         return web.json_response({'error': 'unauthorized'}, status=401)
 
     try:
@@ -302,15 +329,14 @@ async def dashboard_handler(request):
         data = await request.post()
         username = data.get('username', '').strip()
         password = data.get('password', '')
-        if username == WEB_USERNAME and hash_password(password) == hash_password(WEB_PASSWORD):
+        if (hmac.compare_digest(username, WEB_USERNAME) and
+                hmac.compare_digest(password, WEB_PASSWORD)):
             resp = web.HTTPFound('/dashboard')
-            resp.set_cookie('sm_session', hash_password(username + password), max_age=86400 * 7)
+            set_session_cookie(resp, create_session())
             return resp
         return serve_login(error=True)
 
-    session = request.cookies.get('sm_session')
-    expected = hash_password(WEB_USERNAME + WEB_PASSWORD)
-    if not session or session != expected:
+    if not authenticated(request):
         return serve_login()
 
     # Get servers list for sidebar (no stats yet — loaded via JS)
@@ -325,7 +351,7 @@ async def dashboard_handler(request):
         'ip': s.get('ip', ''),
         'username': s.get('username', ''),
         'online': str(s['_id']) in (active_sessions or {})
-    } for s in servers_raw])
+    } for s in servers_raw]).replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026')
 
     return web.Response(content_type='text/html', text=f"""<!DOCTYPE html>
 <html lang="en"><head>
@@ -500,6 +526,10 @@ function pct(val){{
   return isNaN(n) ? 0 : Math.min(100, Math.max(0, n));
 }}
 
+function esc(value){{
+  return String(value ?? '').replace(/[&<>\"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[c]));
+}}
+
 function parseStatVal(val){{
   if(!val || val === '?') return ['—',''];
   const m = String(val).match(/^([\\d.,]+)(.*)$/);
@@ -540,13 +570,13 @@ function renderServers(data){{
     const cls = s.online ? 'online-panel' : 'offline-panel';
     const badgeCls = s.online ? 'online' : 'offline';
     const badgeTxt = s.online ? '● Online' : '● Offline';
-    const init = s.name[0].toUpperCase();
+    const init = esc(s.name).charAt(0).toUpperCase();
 
     // Sidebar entry
     const dotColor = s.online ? 'var(--green)' : 'var(--red)';
-    sbHtml += `<div class="sb-server" onclick="scrollTo('panel-${{s.id}}')">
+    sbHtml += `<div class="sb-server" onclick="scrollTo('panel-${{esc(s.id)}}')">
       <span class="sb-dot" style="background:${{dotColor}}"></span>
-      <span class="sb-name">${{s.name}}</span>
+      <span class="sb-name">${{esc(s.name)}}</span>
     </div>`;
 
     let bodyHtml = '';
@@ -571,15 +601,15 @@ function renderServers(data){{
       </div>`;
     }}
 
-    const osLine = st.os ? `<span style="color:var(--text-3);font-size:.72rem;margin-left:10px">• ${{st.os}}</span>` : '';
-    const upLine = st.uptime ? `<span style="color:var(--text-3);font-size:.72rem;margin-left:6px">↑ ${{st.uptime}}</span>` : '';
+    const osLine = st.os ? `<span style="color:var(--text-3);font-size:.72rem;margin-left:10px">• ${{esc(st.os)}}</span>` : '';
+    const upLine = st.uptime ? `<span style="color:var(--text-3);font-size:.72rem;margin-left:6px">↑ ${{esc(st.uptime)}}</span>` : '';
 
     panelsHtml += `<div class="server-panel ${{cls}}" id="panel-${{s.id}}">
       <div class="panel-header">
         <div class="avatar">${{init}}</div>
         <div>
-          <div class="server-name-txt">${{s.name}} ${{osLine}} ${{upLine}}</div>
-          <div class="server-sub">${{s.username}}@${{s.ip}}</div>
+          <div class="server-name-txt">${{esc(s.name)}} ${{osLine}} ${{upLine}}</div>
+          <div class="server-sub">${{esc(s.username)}}@${{esc(s.ip)}}</div>
         </div>
         <span class="status-badge ${{badgeCls}}">${{badgeTxt}}</span>
       </div>

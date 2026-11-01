@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from config import MONGO_URI
@@ -95,7 +96,7 @@ async def update_server_stats(server_id, stats):
     try:
         result = await servers_collection.update_one(
             {"_id": ObjectId(server_id)},
-            {"$set": {"stats": stats, "last_updated": datetime.utcnow()}}
+            {"$set": {"stats": stats, "last_updated": datetime.now(timezone.utc)}}
         )
         return result.modified_count > 0
     except Exception as e:
