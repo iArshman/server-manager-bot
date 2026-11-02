@@ -2,7 +2,6 @@ import logging
 import io
 import html
 import asyncio
-import os
 import paramiko
 from aiohttp import web as aio_web
 from aiogram import Bot, Dispatcher, types
@@ -11,7 +10,7 @@ from aiogram.utils import executor
 from aiogram.utils.exceptions import MessageNotModified
 from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.dispatcher.handler import CancelHandler
-from config import BOT_TOKEN, SSH_TIMEOUT, SSH_KNOWN_HOSTS, TELEGRAM_ADMIN_IDS
+from config import BOT_TOKEN, SSH_TIMEOUT, TELEGRAM_ADMIN_IDS
 from db import (
     add_server,
     get_servers,
@@ -136,8 +135,7 @@ def get_ssh_session(server_id, ip, username, key_content):
             raise paramiko.SSHException("Unsupported or invalid key format")
         
         ssh = paramiko.SSHClient()
-        ssh.load_host_keys(os.path.expanduser(SSH_KNOWN_HOSTS))
-        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(ip, username=username, pkey=ssh_key, timeout=SSH_TIMEOUT)
         
         active_sessions[server_id] = ssh
@@ -493,8 +491,7 @@ async def handle_key_upload(message: types.Message):
         await message.answer("🔌 Testing connection...")
         
         ssh = paramiko.SSHClient()
-        ssh.load_host_keys(os.path.expanduser(SSH_KNOWN_HOSTS))
-        ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         
         try:
             key_file = io.StringIO(key_content)
