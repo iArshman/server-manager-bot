@@ -551,7 +551,13 @@ async def handle_key_upload(message: types.Message):
 async def view_server(callback: types.CallbackQuery):
     """Show server management menu"""
     try:
+        await callback.answer()
+        logger.info("Server button clicked: user=%s data=%s", callback.from_user.id, callback.data)
         server_id = callback.data.split('_')[1]
+        if not server_id or len(server_id) != 24:
+            logger.warning("Invalid server callback ID: %s", server_id)
+            await callback.message.answer("❌ Invalid server selection. Please use /start again.")
+            return
         server = await get_server_by_id(server_id)
         
         if not server:
@@ -592,7 +598,10 @@ async def view_server(callback: types.CallbackQuery):
         
     except Exception as e:
         logger.error(f"View server error: {e}")
-        await callback.message.edit_text("❌ Error loading server details.")
+        try:
+            await callback.message.edit_text("❌ Error loading server details. Please try /start again.")
+        except Exception:
+            await callback.message.answer("❌ Error loading server details. Please try /start again.")
 
 # --- SERVER INFO ---
 
