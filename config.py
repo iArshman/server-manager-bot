@@ -38,8 +38,6 @@ else:
 # SSH configuration
 SSH_TIMEOUT = int(os.getenv("SSH_TIMEOUT", 15))
 MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", 10))
-SSH_KNOWN_HOSTS = os.getenv("SSH_KNOWN_HOSTS", str(Path.home() / ".ssh" / "known_hosts"))
-
 # File manager configuration
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE_MB", "50")) * 1024 * 1024
 ALLOWED_EXTENSIONS = os.getenv("ALLOWED_EXTENSIONS", None)

@@ -13,8 +13,6 @@ MONGO_URI=YOUR_MONGODB_CONNECTION_URI
 
 # SSH connection timeout (seconds)
 SSH_TIMEOUT=15
-SSH_KNOWN_HOSTS=/root/.ssh/known_hosts
-
 # Maximum simultaneous SSH connections
 MAX_CONNECTIONS=10
 
